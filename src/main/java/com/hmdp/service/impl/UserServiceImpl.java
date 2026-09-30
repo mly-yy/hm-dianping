@@ -54,7 +54,6 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // 5.真实项目这里要调用第三方短信平台发送短信，课程中简化处理：
         //   只把验证码打印到控制台（IDEA控制台可查看），方便测试
         log.debug("发送短信验证码成功，验证码：{}",code);
-
         return Result.ok();
     }
 
