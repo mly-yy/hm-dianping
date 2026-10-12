@@ -36,12 +36,24 @@ public class UploadController {
 
     @GetMapping("/blog/delete")
     public Result deleteBlogImg(@RequestParam("name") String filename) {
-        File file = new File(SystemConstants.IMAGE_UPLOAD_DIR, filename);
-        if (file.isDirectory()) {
-            return Result.fail("错误的文件名称");
+        File baseDir = new File(SystemConstants.IMAGE_UPLOAD_DIR);
+        File file = new File(baseDir, filename);
+        try {
+            // 规范化路径，任何解析到上传目录之外的请求都拒绝（防 ../ 路径穿越）
+            String basePath = baseDir.getCanonicalPath();
+            String targetPath = file.getCanonicalPath();
+            if (!targetPath.equals(basePath) && !targetPath.startsWith(basePath + File.separator)) {
+                return Result.fail("非法的文件路径");
+            }
+            // 目录不允许通过该接口删除
+            if (file.isDirectory()) {
+                return Result.fail("错误的文件名称");
+            }
+            FileUtil.del(file);
+            return Result.ok();
+        } catch (IOException e) {
+            throw new RuntimeException("文件删除失败", e);
         }
-        FileUtil.del(file);
-        return Result.ok();
     }
 
     private String createNewFileName(String originalFilename) {
