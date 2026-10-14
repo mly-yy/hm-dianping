@@ -12,6 +12,7 @@ import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisData;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -33,6 +34,7 @@ import static com.hmdp.utils.RedisConstants.*;
  * @since 2021-12-22
  */
 @Service
+@Slf4j
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
 
     @Autowired
@@ -69,8 +71,8 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         JSONObject data =(JSONObject) redisData.getData();
         Shop shop = JSONUtil.toBean(data, Shop.class);
         LocalDateTime expireTime = redisData.getExpireTime();
-        //5 判断是否过期
-        if (expireTime.isAfter(LocalDateTime.now())){
+        //5 判断是否过期（expireTime 可能为null，必须先判空，否则 isAfter 会抛NPE）
+        if (expireTime != null && expireTime.isAfter(LocalDateTime.now())){
             //5.1未过期，直接返回店铺信息
             return shop;
         }
@@ -85,10 +87,12 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             shopJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_KEY + id);
             if(StrUtil.isNotBlank(shopJson)){
                 RedisData newRedisData = JSONUtil.toBean(shopJson, RedisData.class);
-                if(newRedisData.getExpireTime().isAfter(LocalDateTime.now())){
-                    //别的线程已经重建好了，直接返回，不要新建任务
+                LocalDateTime newExpireTime = newRedisData.getExpireTime();
+                if(newExpireTime != null && newExpireTime.isAfter(LocalDateTime.now())){
+                    //别的线程已经重建好了，释放锁并返回【新数据】
+                    //【重要】原来这里 return shop（旧数据），应该返回刚拿到的新数据
                     unlock(lockKey);
-                    return shop;
+                    return JSONUtil.toBean((JSONObject) newRedisData.getData(), Shop.class);
                 }
             }
             //6.3 成功，开启独立线程，实现缓存重建
@@ -96,7 +100,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
                 try {
                     this.saveShop2Redis(id,1200L);
                 } catch (Exception e) {
-                    throw new RuntimeException(e);
+                    log.error("缓存重建任务异常", e);
                 } finally {
                     //释放锁
                     unlock(lockKey);
@@ -126,22 +130,41 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         //4.1 获取互斥锁
         String lockKey = LOCK_SHOP_KEY + id;
         Shop shop = null;
+        boolean isLock = false;
         try {
-            boolean isLock = tryLock(lockKey);
+            isLock = tryLock(lockKey);
             //4.2 判断是否获取成功
             if (!isLock){
-                //4.3 失败，休眠并重试
-                Thread.sleep(50);
-               return queryWithMutex(id);
+                //4.3 失败，休眠后【循环重试】
+                //【重要】原来用的是递归 queryWithMutex(id)，有两个问题：
+                //  1) 数据库慢时递归层数线性增长，有 StackOverflowError 风险
+                //  2) 递归返回后每一层的 finally 都会执行 unlock，
+                //     而未持锁的线程会删掉【别人持有】的锁，导致互斥失效
+                // 现在改成 while 循环重试，并且只在真正持锁时才释放锁
+                while (!isLock) {
+                    Thread.sleep(50);
+                    shopJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_KEY + id);
+                    if (StrUtil.isNotBlank(shopJson)) {
+                        //别人已经重建好了，直接返回
+                        return JSONUtil.toBean(shopJson, Shop.class);
+                    }
+                    if (shopJson != null) {
+                        //命中的是空值缓存
+                        return null;
+                    }
+                    isLock = tryLock(lockKey);
+                }
             }
-
             //4.4 成功，根据id查询
             shop = queryWithPassThrough(id);
         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             throw new RuntimeException(e);
         }finally {
-            //7 释放互斥锁
-            unlock(lockKey);
+            //7 释放互斥锁：只有【确实持有锁】的线程才有权释放，防止误删别人的锁
+            if (isLock) {
+                unlock(lockKey);
+            }
         }
         //8返回
         return shop;

@@ -87,7 +87,10 @@ public class CacheClient {
         //5.2 已过期，需要缓存重建
         //6 缓存重建
         //6.1 获取互斥锁
-        String lockKey = keyPrefix +id;
+        //【重要】锁的key必须和缓存key区分开！
+        // 原来写成 keyPrefix + id 会和缓存key完全相同，因为能走到这行说明缓存key必然已存在，
+        // setIfAbsent 永远返回 false -> 永远拿不到锁 -> 缓存永不重建 -> 数据永久脏
+        String lockKey = "lock:" + keyPrefix + id;
         boolean isLock = tryLock(lockKey);
         //6.2 判断是否获取锁成功
         if(isLock){
@@ -96,10 +99,9 @@ public class CacheClient {
             if(StrUtil.isNotBlank(json)){
                 RedisData newRedisData = JSONUtil.toBean(json, RedisData.class);
                 if(newRedisData.getExpireTime().isAfter(LocalDateTime.now())){
-                    //别的线程已经重建好了，直接返回，不要新建任务
+                    //别的线程已经重建好了，直接返回新数据，不要新建任务
                     unlock(lockKey);
-                    R newR = JSONUtil.toBean((JSONObject) newRedisData.getData(), type);
-                    return newR;
+                    return JSONUtil.toBean((JSONObject) newRedisData.getData(), type);
                 }
             }
             //6.3 成功，开启独立线程，实现缓存重建
@@ -108,10 +110,15 @@ public class CacheClient {
                     //查询数据库
                     R r1 = dbFallback.apply(id);
                     //写入redis
+                    //【注意】数据不存在时不能写入 data:null，
+                    //否则下次请求反序列化会NPE，且每次都击穿到数据库
+                    if (r1 == null) {
+                        log.warn("缓存重建失败，数据库中不存在该数据，key={}", key);
+                        return;
+                    }
                     this.setWithLogicalExpire(key,r1,time,unit);
                 } catch (Exception e) {
                     log.error("缓存重建异步任务异常",e);
-                    throw new RuntimeException(e);
                 } finally {
                     //释放锁
                     unlock(lockKey);
@@ -120,7 +127,7 @@ public class CacheClient {
             });
         }
 
-        //6.4 返回过期的商铺信息
+        //6.4 未获取到锁（说明已有线程在重建）或刚提交重建任务，先返回过期的旧数据
         return r;
     }
     private boolean tryLock(String key){
